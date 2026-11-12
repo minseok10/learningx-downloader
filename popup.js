@@ -1,4 +1,10 @@
+// Safari exposes the WebExtension API as `browser`; Chrome as `chrome`.
+const api = globalThis.browser ?? globalThis.chrome;
+
 const view = document.querySelector('#wrapper');
+
+// Pattern to match KHU video embed endpoints
+const VIDEO_PATTERN = /^https:\/\/commons\.khu\.ac\.kr\/em\/[a-zA-Z0-9]+/;
 
 // Error messages
 const ERRORS = {
@@ -17,6 +23,7 @@ const BACKEND_URL = 'http://localhost:52022/download';
 // Download queue to serialize downloads in popup
 const downloadQueue = [];
 let isDownloading = false;
+let currentTabId = null;
 
 // Main function
 (async () => {
@@ -27,6 +34,7 @@ let isDownloading = false;
       showError('탭 정보를 가져올 수 없습니다');
       return;
     }
+    currentTabId = tab.id;
 
     // Check if the current page is a LearningX course
     const isLearningX = await checkIfLearningX(tab.id);
@@ -46,7 +54,7 @@ let isDownloading = false;
 // Helper functions
 async function getActiveTab() {
   try {
-    const tabs = await chrome.tabs.query({active: true, currentWindow: true});
+    const tabs = await api.tabs.query({active: true, currentWindow: true});
     return tabs[0];
   } catch (error) {
     console.error('Error getting active tab:', error);
@@ -57,14 +65,15 @@ async function getActiveTab() {
 async function checkIfLearningX(tabId) {
   try {
     // First check if we can access the tab's URL directly
-    const tab = await chrome.tabs.get(tabId);
+    const tab = await api.tabs.get(tabId);
     
     // Check for restricted URLs that we can't inject into
     if (!tab.url || 
         tab.url.startsWith('chrome://') || 
         tab.url.startsWith('edge://') || 
         tab.url.startsWith('about:') || 
-        tab.url.startsWith('chrome-extension://')) {
+        tab.url.startsWith('chrome-extension://') ||
+        tab.url.startsWith('safari-web-extension://')) {
       return false;
     }
 
@@ -74,7 +83,7 @@ async function checkIfLearningX(tabId) {
     }
 
     // For other URLs, try executing the script
-    const results = await chrome.scripting.executeScript({
+    const results = await api.scripting.executeScript({
       target: {tabId: tabId},
       func: () => window.location.href.includes('khcanvas.khu.ac.kr')
     });
@@ -89,23 +98,85 @@ async function checkIfLearningX(tabId) {
 async function scanForVideos(tabId) {
   console.log(`[popup.js] scanForVideos called with tabId: ${tabId}`);
   try {
-    // Request stored video URLs from background
-    const response = await chrome.runtime.sendMessage({ action: 'getVideos', tabId });
-    console.log('[popup.js] scanForVideos: getVideos response:', response);
+    // 1) URLs captured by the background via webRequest (Chrome only;
+    //    Safari has no webRequest in MV3 and may unload the background at any time)
+    let fromBackground = [];
+    try {
+      const response = await api.runtime.sendMessage({ action: 'getVideos', tabId });
+      fromBackground = response?.videos || [];
+    } catch (e) {
+      console.warn('[popup.js] getVideos from background failed:', e);
+    }
 
-    const videos = response.videos || [];
+    // 2) URLs found by scanning the tab's frames directly (works in Safari and Chrome)
+    const fromFrames = await scanFramesForVideos(tabId);
+
+    // Deduplicate by content id
+    const byId = new Map();
+    for (const url of [...fromBackground, ...fromFrames]) {
+      const id = url.split('?')[0].split('/').pop();
+      if (!byId.has(id)) byId.set(id, url);
+    }
+    const videos = Array.from(byId.values());
     console.log('[popup.js] scanForVideos: videos array:', videos);
     if (videos.length === 0) {
-      console.log('[popup.js] scanForVideos: no videos found, showing NO_VIDEOS error');
       view.innerHTML = ERRORS.NO_VIDEOS;
       return;
     }
 
-    console.log('[popup.js] scanForVideos: found videos, calling listVideos');
     await listVideos(videos);
   } catch (error) {
     console.error('Error scanning for videos:', error);
     showError(`비디오 스캔 오류: ${error.message}`);
+  }
+}
+
+// Inject into every frame we have host permission for and collect video
+// embed URLs (the frame's own URL plus any matching iframe src attributes).
+async function scanFramesForVideos(tabId) {
+  try {
+    const results = await api.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      func: () => {
+        const urls = [window.location.href];
+        document.querySelectorAll('iframe[src]').forEach(f => urls.push(f.src));
+        return urls;
+      }
+    });
+    const urls = (results || []).flatMap(r => r?.result || []);
+    return urls.filter(u => VIDEO_PATTERN.test(u));
+  } catch (error) {
+    console.warn('[popup.js] frame scan failed:', error);
+    return [];
+  }
+}
+
+// Fetch metadata XML from inside a commons.khu.ac.kr frame (same-origin request).
+// Used as a fallback when the background fetch is unavailable or blocked (e.g. Safari).
+async function fetchMetadataInFrame(tabId, id) {
+  const results = await api.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    args: [id],
+    func: async (contentId) => {
+      if (window.location.hostname !== 'commons.khu.ac.kr') return null;
+      const res = await fetch(`/viewer/ssplayer/uniplayer_support/content.php?content_id=${contentId}`);
+      if (!res.ok) return null;
+      return await res.text();
+    }
+  });
+  const xml = (results || []).map(r => r?.result).find(Boolean);
+  if (!xml) throw new Error('metadata fetch in frame failed');
+  return xml;
+}
+
+async function getMetadataXml(id) {
+  try {
+    const response = await api.runtime.sendMessage({ action: 'getMetadata', id });
+    if (response?.xml) return response.xml;
+    throw new Error(response?.error || 'No XML returned from background');
+  } catch (error) {
+    console.warn(`[popup.js] background metadata fetch failed for ${id}, trying in-frame:`, error);
+    return await fetchMetadataInFrame(currentTabId, id);
   }
 }
 
@@ -162,18 +233,8 @@ async function processVideo(video, container) {
       return;
     }
 
-    // Request metadata XML from background
-    const response = await new Promise(resolve => 
-      chrome.runtime.sendMessage({ action: 'getMetadata', id }, resolve)
-    );
-    console.log(`[popup.js] processVideo: getMetadata response:`, response);
-    if (response.error) {
-      throw new Error(response.error);
-    }
-    const xmlText = response.xml;
-    if (!xmlText) {
-      throw new Error('No XML returned from background');
-    }
+    // Request metadata XML (background first, in-frame fallback)
+    const xmlText = await getMetadataXml(id);
 
     // Parse XML
     const dom = (new DOMParser()).parseFromString(xmlText, 'text/xml');

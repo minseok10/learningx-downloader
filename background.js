@@ -1,5 +1,8 @@
 // background.js
 
+// Safari exposes the WebExtension API as `browser`; Chrome as `chrome`.
+const api = globalThis.browser ?? globalThis.chrome;
+
 // Pattern to match KHU video endpoints
 const VIDEO_PATTERN = /^https:\/\/commons\.khu\.ac\.kr\/em\/[a-zA-Z0-9]+/;
 
@@ -7,7 +10,8 @@ const VIDEO_PATTERN = /^https:\/\/commons\.khu\.ac\.kr\/em\/[a-zA-Z0-9]+/;
 const videoMap = {};
 
 // Listen to all web requests to KHU commons video paths
-chrome.webRequest.onBeforeRequest.addListener(
+// webRequest is unavailable in Safari (MV3); the popup scans frames instead.
+if (api.webRequest?.onBeforeRequest) api.webRequest.onBeforeRequest.addListener(
   (details) => {
     const { url, tabId } = details;
     console.log(`[background.js] onBeforeRequest - url: ${url}, tabId: ${tabId}`);
@@ -37,7 +41,7 @@ chrome.webRequest.onBeforeRequest.addListener(
 // );
 
 // Clear video URLs when a tab starts loading a new page
-chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+api.tabs.onUpdated.addListener((tabId, changeInfo) => {
   console.log(`[background.js] onUpdated - tab: ${tabId}, status: ${changeInfo.status}`);
   if (changeInfo.status === 'loading' && videoMap[tabId]) {
     console.log(`[background.js] clearing videoMap for tab ${tabId} on loading`);
@@ -46,7 +50,7 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
 });
 
 // Clean up when a tab is closed
-chrome.tabs.onRemoved.addListener((tabId) => {
+api.tabs.onRemoved.addListener((tabId) => {
   console.log(`[background.js] onRemoved - tab: ${tabId}`);
   if (videoMap[tabId]) {
     console.log(`[background.js] deleting videoMap for closed tab ${tabId}`);
@@ -55,7 +59,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
 });
 
 // Respond to popup requests for videos
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+api.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log(`[background.js] onMessage - request: ${JSON.stringify(request)}, sender: ${JSON.stringify(sender)}`);
   if (request.action === 'getVideos') {
     console.log(`[background.js] getVideos for tabId: ${request.tabId}`);
@@ -68,7 +72,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // Respond to popup requests for metadata
-chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+api.runtime.onMessage.addListener((request, sender, sendResponse) => {
   if (request.action === 'getMetadata') {
     const id = request.id;
     const url = `https://commons.khu.ac.kr/viewer/ssplayer/uniplayer_support/content.php?content_id=${id}`;
@@ -91,7 +95,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 });
 
 // Respond to log requests
-chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+api.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.action === 'log') {
     console.log(`[${message.data.type}]`, message.data.details);
   }
@@ -104,7 +108,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // chrome.downloads.onCreated.addListener(item => {});
 // chrome.downloads.onChanged.addListener(delta => {});
 // function handleDownload(request, sendResponse) { /*...*/ }
-// chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+// api.runtime.onMessage.addListener((request, sender, sendResponse) => {
 //   if (request.action === 'downloadVideo') {
 //     handleDownload(request, sendResponse);
 //     return true;
